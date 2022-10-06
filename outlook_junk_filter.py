@@ -1,32 +1,15 @@
-import imaplib
 import re
+import email.header
+import imaplib
+import tqdm
 
 import config
+import junk_keywords
 
 
 class OutlookJunkFilter():
-    def __init__(self, input_keywords):
+    def __init__(self):
         self.imap = None
-        # we have to split the keywords because of the OR limitation
-        self.keywordset = []
-        keywords = []
-        count = 0
-        for keyword in input_keywords:
-            keywords.append(keyword)
-            count += 1
-            if(keyword.find(' ') >= 0):
-                keywords.append(keyword.replace(' ', ''))
-                count += 1
-
-            # looks like IMAP can only do a max of 9 or so operands for OR
-            if(count >= 9):
-                self.keywordset.append(keywords)
-                keywords = []
-                count = 0
-
-        # get any remainder keywords
-        if(count != 0):
-            self.keywordset.append(keywords)
 
     def login(self, username, password):
         self.username = username
@@ -37,23 +20,32 @@ class OutlookJunkFilter():
             # self.imap.starttls()
             r, d = self.imap.login(username, password)
             assert r == 'OK', 'login failed: %s' % str(r)
-            print("Signed in as %s" % self.username, d)
-            return
+            print("\tSigned in as %s" % self.username)
         except Exception as err:
-            print("Sign in error: %s" % str(err))
+            print("\tSign in error: %s" % str(err))
             assert False, 'login failed'
 
     def logout(self):
         self.imap.close()
         self.imap.logout()
 
+    def delete_junk(self, msgs):
+        if(len(msgs) > 0):
+            print(f'\tExecuting delete')
+            self.imap.uid('STORE',
+                          ','.join(msgs),
+                          '+FLAGS', '\\Deleted')
+            print(f'\t{len(msgs)} msgs were deleted')
+        else:
+            print(f'\tNo msgs were deleted')
+
     def parse(self, uid, from_str, subj):
-        pattern = r'"([^"]*)" <([^@]*)@([^>]*)>'
+        pattern = r'([^<]*)<([^@]*)@([^>]*)>'
         matches = re.search(pattern, from_str[6:])
         if(matches):
             return {'uid': uid,
-                    'from': from_str[6:],
-                    'f_name': matches.group(1),
+                    'from': from_str[6:].replace('"', ''),
+                    'f_name': matches.group(1).replace('"', ''),
                     'f_user': matches.group(2),
                     'f_domain': matches.group(3),
                     'subj': subj[9:]}
@@ -71,114 +63,127 @@ class OutlookJunkFilter():
                         'from': from_str[6:],
                         'subj': subj[9:]}
 
-    def list_msgs(self, criteria):
-        msgs = []
-        domains = {}
-        if(not criteria):
-            print('\tno criteria specified')
-            return msgs, domains
+    def decode_mime_words(self, s):
+        words=[]
+        decoded = False
+        for word, encoding in email.header.decode_header(s):
+            if(encoding):
+                decoded = True
+            if isinstance(word, bytes):
+                word = word.decode(encoding or 'utf8')
+            words.append(word)
+        return (''.join(words), decoded)
+
+
+    def iterate_msgs(self):
+        kept_msgs = []
+        junk_uids = []
+        junk_domains = set()
+        jkws = set(junk_keywords.junk_keywords)
+        pattern = r'([^@]*)@([^$]*)'
+        matches = re.search(pattern, self.username)
+        if(matches):
+            jkws.add(matches.group(1)),
 
         self.imap.select('Junk')
-        r, d = self.imap.uid('SEARCH', criteria)
+
+        r, d = self.imap.uid('SEARCH', 'ALL')
         if(not d[0].decode()):
-            print('\tno emails found')
-            return msgs, domains
+            print('\tExiting, no emails found')
+            return junk_uids
 
         uids = d[0].decode().split(' ')
 
         if(len(uids) < 1):
-            print('\tno uids returned')
-            return msgs, domains
+            print('\tExiting, no emails found')
+            return junk_uids
 
+        print(f'\t{len(uids)} msgs to process in "Junk Email" folder')
 
-        resp, data = self.imap.uid('FETCH',
-                                   ','.join(map(str, uids)),
-                                   '(BODY.PEEK[HEADER.FIELDS (From Subject)] RFC822.SIZE)')
-        iterator = iter(data)
-        for rmsg in iterator:
-            dmsg = rmsg[1].decode().split('\r\n')[:2]
+        del_file = open("messages_deleted.txt", "w")
+        kept_file = open("messages_kept.txt", "w")
 
-            # uid is the next item in the array
-            # so we use the iterator to manually advance
-            rmsg = next(iterator)
-            uid = rmsg.decode().split(' ')[4][:-1]
-            if(dmsg[0][0:4] == 'From'):
-                msg = self.parse(uid, dmsg[0], dmsg[1])
-            else:
-                msg = self.parse(uid, dmsg[1], dmsg[0])
+        regex = re.compile('[^a-zA-Z0-9]')
+        try:
+            with tqdm.tqdm(total=len(uids), bar_format='\t{percentage:3.0f}%[{bar:20}] {remaining}s left') as pbar:
+                for uid in uids:
+                    resp, data = self.imap.uid('FETCH',
+                                           str(uid),
+                                           '(BODY.PEEK[HEADER.FIELDS (From Subject)] RFC822.SIZE)')
+                    raw_header = data[0][1].decode()
+                    (decoded_header, decoded) = self.decode_mime_words(raw_header)
+                    if(decoded):
+                        if(decoded_header[0:4] == 'From'):
+                            decoded_header = decoded_header.replace('Subject', '\r\nSubject')
+                        else:
+                            decoded_header = decoded_header.replace('From', '\r\nFrom')
 
-            msgs.append(msg)
-            if 'f_domain' in msg.keys():
-                domain = msg['f_domain']
-                if(domain not in domains.keys()):
-                    domains[domain] = 0
-                domains[domain] += 1
-        return msgs, domains
+                    from_subject = decoded_header.split('\r\n')
 
-    def build_or_criteria(self, items):
-        if(len(items) == 0):
-            return ''
-        elif(len(items) == 1):
-            return 'UNSEEN ' + items[0]
-        else:
+                    if(from_subject[0][0:4] == 'From'):
+                        parsed = self.parse(uid, from_subject[0], from_subject[1])
+                    else:
+                        parsed = self.parse(uid, from_subject[1], from_subject[0])
+
+                    if('f_domain' not in parsed):
+                        # if we can't find an email domain, this is junk
+                        junk_uids.append(parsed['uid'])
+                        del_file.write(f"raw={parsed['from']}\n")
+                    else:
+                        domain_parts = parsed['f_domain'].split('.')
+                        if(len(domain_parts) == 0):
+                            # invalid domain, this is more junk
+                            junk_uids.append(parsed['uid'])
+                            junk_domains.add(parsed['f_domain'])
+                            del_file.write(f"raw={parsed['from']}\n")
+                        elif('f_name' in parsed):
+                            # if we have a from name, check it for typical junk
+                            # first, we strip all non a-Z characters
+                            f_name = regex.sub('', parsed['f_name']).lower()
+                            # second, ensure it doesn't have the domain in it (we strip the last participle..mostly the .com)
+                            # we check also if it is in the user portion
+                            # (e.g., warby parkers shouldn't be deleted if the domain is legit
+                            if(not any(dp.lower() in f_name for dp in domain_parts[:-1]) and
+                               parsed['f_user'].lower() not in f_name and
+                               any(keyword in f_name for keyword in jkws)):
+                                junk_uids.append(parsed['uid']);
+                                junk_domains.add(parsed['f_domain'])
+                                del_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+                            else:
+                                kept_msgs.append(parsed)
+                                kept_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+                        else:
+                            kept_msgs.append(parsed)
+                            kept_file.write(f"email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+
+                    pbar.update(1)
+            junk_pct = len(junk_uids)/len(uids) * 100
             count = 0
-            ret = ''
-            for item in items:
-                if(count == 0):
-                    pass
-                elif(count == 1):
-                    ret += f'OR {items[0]} {items[1]} '
-                elif(count < 10):
-                    ret = 'OR ' + ret + item + ' '
-                else:
-                    print(f'WARNING: OR limit reached: {item}')
-                count += 1
-            return 'UNSEEN ' + ret
+            for msg in kept_msgs:
+                if(msg['f_domain'] in junk_domains):
+                    junk_uids.append(msg['uid'])
+                    count += 1
+            if(count > 0):
+                print(f"\t{len(junk_uids)} junk messages found based on keywords; {count} by common domain")
+            else:
+                print(f"\t{len(junk_uids)} ({junk_pct:.1f}%) were junk msgs")
+            print('\t\tdeleted msgs can be found in: messages_deleted.txt')
+            print('\t\tretained msgs can be found in: messages_kept.txt')
+        finally:
+            kept_file.close()
+            del_file.close()
 
-    def delete_junk(self, msgs, domains):
-        if(len(msgs) > 0):
-            print(f'\tDeleting: {len(msgs)} msgs')
-            self.imap.uid('STORE',
-                          ','.join([msg['uid'] for msg in msgs]),
-                          '+FLAGS', '\\Deleted')
-        if(domains and len(domains) > 0):
-            print('\tFinding msgs with same domains as junk msgs...')
-            terms = []
-            for domain, count in domains.items():
-                if(count > 1):
-                    terms.append(f'FROM "{domain}"')
-            criteria = self.build_or_criteria(terms)
-            if(criteria):
-                msgs, domains = self.list_msgs(criteria)
-                self.delete_junk(msgs, None)
-        # self.imap.expunge()
-        return len(msgs)
-
-    def build_junk_criteria(self, keywords):
-        ret = []
-        for keyword in keywords:
-            ret.append(f'FROM "{keyword}"')
-        return self.build_or_criteria(ret)
-
-    def find_junk(self, keywords):
-        return self.list_msgs(self.build_junk_criteria(keywords))
-
-    def process_junk(self):
-        count = 1
-        for keywords in self.keywordset:
-            print(f'---Keywordset {count}: {keywords}---')
-            msgs, domains = self.find_junk(keywords)
-            if(len(msgs) > 0):
-                print(f'\tfound: {len(msgs)} msgs for {len(domains)} domains')
-                self.delete_junk(msgs, domains)
-            count += 1
+        return junk_uids
 
 
 def main():
-    mail = OutlookJunkFilter(config.junk_keywords)
-    mail.login(config.user, config.pwd)
-    mail.process_junk()
-    mail.logout()
+    mail = OutlookJunkFilter()
+    try:
+        mail.login(config.user, config.pwd)
+        junk_uids = mail.iterate_msgs()
+        mail.delete_junk(junk_uids)
+    finally:
+        mail.logout()
 
 
 if __name__ == "__main__":
