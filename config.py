@@ -1,8 +1,8 @@
 # the email account
-user = 'phoebus8@hotmail.com'
+user = 'xxx@hotmail.com'
 
 # the app password for the email account
-pwd = 'zoyqkpbivdeuqctf'
+pwd = 'abcdefghijklmnop'
 
 # outlook domain
 server = 'outlook.office365.com'
