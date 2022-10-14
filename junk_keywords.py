@@ -125,6 +125,7 @@ junk_keywords = [
     'trugreen',
     'universitydegrees',
     'usamilitarysavings',
+    'vaadministration',
     'vivint',
     'walkintubforseniors',
     'warranty',

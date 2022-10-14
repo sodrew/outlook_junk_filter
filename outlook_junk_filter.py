@@ -74,6 +74,8 @@ class OutlookJunkFilter():
             words.append(word)
         return (''.join(words), decoded)
 
+    def ireplace(self, old, repl, text):
+        return re.sub('(?i)'+re.escape(old), lambda m: repl, text)
 
     def iterate_msgs(self):
         kept_msgs = []
@@ -113,10 +115,10 @@ class OutlookJunkFilter():
                     raw_header = data[0][1].decode()
                     (decoded_header, decoded) = self.decode_mime_words(raw_header)
                     if(decoded):
-                        if(decoded_header[0:4] == 'From'):
-                            decoded_header = decoded_header.replace('Subject', '\r\nSubject')
+                        if(decoded_header[0:4].lower() == 'from'):
+                            decoded_header = self.ireplace('Subject', '\r\nSubject', decoded_header)
                         else:
-                            decoded_header = decoded_header.replace('From', '\r\nFrom')
+                            decoded_header = self.ireplace('From', '\r\nFrom', decoded_header)
 
                     from_subject = decoded_header.split('\r\n')
 
@@ -124,7 +126,6 @@ class OutlookJunkFilter():
                         parsed = self.parse(uid, from_subject[0], from_subject[1])
                     else:
                         parsed = self.parse(uid, from_subject[1], from_subject[0])
-
                     if('f_domain' not in parsed):
                         # if we can't find an email domain, this is junk
                         junk_uids.append(parsed['uid'])
@@ -138,11 +139,14 @@ class OutlookJunkFilter():
                             del_file.write(f"raw={parsed['from']}\n")
                         elif('f_name' in parsed):
                             # if we have a from name, check it for typical junk
-                            # first, we strip all non a-Z characters
-                            f_name = regex.sub('', parsed['f_name']).lower()
-                            # second, ensure it doesn't have the domain in it (we strip the last participle..mostly the .com)
-                            # we check also if it is in the user portion
-                            # (e.g., warby parkers shouldn't be deleted if the domain is legit
+                            from unidecode import unidecode
+                            # first, convert any unicode to ascii
+                            f_name = unidecode( parsed['f_name'])
+
+                            # second, we strip all non a-Z characters
+                            f_name = regex.sub('', f_name).lower()
+
+                            # third, ensure the from and user doesn't match the domain (we strip the last participle..mostly the .com).  (e.g., warby parkers shouldn't be deleted if the domain is legit
                             if(not any(dp.lower() in f_name for dp in domain_parts[:-1]) and
                                parsed['f_user'].lower() not in f_name and
                                any(keyword in f_name for keyword in jkws)):
@@ -162,6 +166,7 @@ class OutlookJunkFilter():
             for msg in kept_msgs:
                 if(msg['f_domain'] in junk_domains):
                     junk_uids.append(msg['uid'])
+                    del_file.write(f"sender={msg['f_name']} email={msg['f_user']}@{msg['f_domain']} debug=<junk_domain>\n")
                     count += 1
             if(count > 0):
                 print(f"\t{len(junk_uids)} junk messages found based on keywords; {count} by common domain")
