@@ -1,17 +1,21 @@
 import re
 import email.header
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import imaplib
+import smtplib
+
 import tqdm
 
 import config
 import junk_keywords
 
-
 class OutlookJunkFilter():
     def __init__(self):
         self.imap = None
+        self.smtp = None
 
-    def login(self, username, password):
+    def login(self, username, password, smtp=True):
         self.username = username
         self.password = password
         try:
@@ -20,7 +24,17 @@ class OutlookJunkFilter():
             # self.imap.starttls()
             r, d = self.imap.login(username, password)
             assert r == 'OK', 'login failed: %s' % str(r)
-            print("\tSigned in as %s" % self.username)
+            print("\tIMAP Signed in as %s" % self.username)
+            self.imap.select('Junk')
+
+            if(smtp):
+                self.smtp = smtplib.SMTP(config.server_smtp,
+                                             config.port_smtp)
+                self.smtp.starttls()
+                r, d = self.smtp.login(username, password)
+                assert r == 235, 'login failed: %s' % str(r)
+                print("\tSMTP Signed in as %s" % self.username)
+
         except Exception as err:
             print("\tSign in error: %s" % str(err))
             assert False, 'login failed'
@@ -28,6 +42,32 @@ class OutlookJunkFilter():
     def logout(self):
         self.imap.close()
         self.imap.logout()
+        if(self.smtp):
+            self.smtp.quit()
+
+    def send(self, recipient, subject, msg_text, msg_html=''):
+        # Instance of MIMEMultipart
+        msg = MIMEMultipart("alternative")
+
+        # Write the subject
+        msg["Subject"] = subject
+
+        msg["From"] = self.username
+        msg["To"] = recipient
+
+        # Attach the Plain body with the msg instance
+        msg.attach(MIMEText(msg_text, "plain"))
+
+        if(msg_html == ''):
+            msg_html = '<p>'+msg_text+'</p>'
+
+        # Attach the HTML body with the msg instance
+        msg.attach(MIMEText(msg_html, "html"))
+
+        # Sending the mail
+        self.smtp.sendmail(self.username, recipient, msg.as_string())
+        print('message to :{recipient} sent')
+
 
     def delete_junk(self, msgs):
         if(len(msgs) > 0):
@@ -86,8 +126,6 @@ class OutlookJunkFilter():
         matches = re.search(pattern, self.username)
         if(matches):
             jkws.add(matches.group(1)),
-
-        self.imap.select('Junk')
 
         r, d = self.imap.uid('SEARCH', 'ALL')
         if(not d[0].decode()):
@@ -184,7 +222,8 @@ class OutlookJunkFilter():
 def main():
     mail = OutlookJunkFilter()
     try:
-        mail.login(config.user, config.pwd)
+        mail.login(config.user, config.pwd, smtp=False)
+        # mail.send('drew.chi@outlook.com', 'hi', 'testing')
         junk_uids = mail.iterate_msgs()
         mail.delete_junk(junk_uids)
     finally:
