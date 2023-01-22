@@ -14,10 +14,10 @@ class OutlookJunkFilter():
     def __init__(self):
         self.imap = None
         self.smtp = None
+        self.username = None
 
     def login(self, username, password, smtp=True):
         self.username = username
-        self.password = password
         try:
             self.imap = imaplib.IMAP4_SSL(config.server,
                                           config.port)
@@ -30,8 +30,10 @@ class OutlookJunkFilter():
             if(smtp):
                 self.smtp = smtplib.SMTP(config.server_smtp,
                                              config.port_smtp)
+                self.smtp.ehlo('mylowercasehost')
                 self.smtp.starttls()
-                r, d = self.smtp.login(username, password)
+                self.smtp.ehlo('mylowercasehost')
+                r, d = self.smtp.login(username, password, initial_response_ok=True)
                 assert r == 235, 'login failed: %s' % str(r)
                 print("\tSMTP Signed in as %s" % self.username)
 
@@ -222,8 +224,8 @@ class OutlookJunkFilter():
 def main():
     mail = OutlookJunkFilter()
     try:
-        mail.login(config.user, config.pwd, smtp=False)
-        # mail.send('drew.chi@outlook.com', 'hi', 'testing')
+        mail.login(config.user, config.pwd)
+        mail.send(config.notify, 'hi', 'testing')
         junk_uids = mail.iterate_msgs()
         mail.delete_junk(junk_uids)
     finally:
