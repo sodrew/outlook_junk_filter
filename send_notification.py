@@ -10,11 +10,10 @@ class NotifyViaMail:
         self.smtp = None
         self.username = None
 
-    def login(self, username, password):
+    def login(self, username, password, server, port):
         self.username = username
         try:
-            self.smtp = smtplib.SMTP(config.server_smtp,
-                                         config.port_smtp)
+            self.smtp = smtplib.SMTP(server, port)
             # self.smtp.set_debuglevel(1)
             lhost = socket.gethostname().lower()
             self.smtp.ehlo(lhost)
@@ -32,44 +31,25 @@ class NotifyViaMail:
         msg["Subject"] = subject
         msg.set_content(message)
 
-        if(filepath != '');
+        if filepath != '':
             path = Path(filepath)
             filename = path.name
             msg.add_attachment(open(path, "r").read(), filename=filename)
 
         # Sending the mail
         self.smtp.sendmail(self.username, recipient, msg.as_string())
-        print(f'message to :{recipient} sent')
+        print(f'message to: {recipient} sent')
 
     def logout(self):
         self.smtp.quit()
 
-from email.message import EmailMessage
 def main():
     mail = NotifyViaMail()
     try:
-        mail.login(config.user, config.pwd)
-        mail.send(config.notify, 'hi', 'testing', '~/desktop/outlook_junk_filter/README.md')
+        mail.login(config.user, config.pwd, config.server_smtp, config.port_smtp)
+        mail.send(config.notify, 'hi', 'testing', '/home/drew/desktop/outlook_junk_filter/README.md')
     finally:
         mail.logout()
 
-    # sender = 'somename@outlook.com'
-    # recipient = 'somename@gmail.com'
-
-    # msg = EmailMessage()
-    # msg.set_content('this is a test')
-    # msg['From'] = config.user
-    # msg['To'] = config.notify
-    # msg['Subject'] = 'test email'
-
-    # with smtplib.SMTP('smtp.office365.com', 587) as server:
-    #     server.set_debuglevel(1)
-    #     server.ehlo('lowercasehost')
-    #     server.starttls()
-    #     server.ehlo('lowercasehost')
-    #     server.login(config.user, config.pwd)
-    #     server.sendmail(config.user, config.notify, msg.as_string())
-    #     print('Email sent!')
-    #     server.close()
 if __name__ == "__main__":
     main()
