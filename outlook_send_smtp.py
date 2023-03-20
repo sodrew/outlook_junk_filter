@@ -42,7 +42,8 @@ class OutlookSendSmtp:
         print('\t' + f'Message to: {recipient} sent')
 
     def logout(self):
-        self.smtp.quit()
+        if self.smtp:
+            self.smtp.quit()
 
 def main():
     mail = OutlookSendSmtp()

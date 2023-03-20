@@ -66,13 +66,17 @@ class OutlookJunkFilter():
                         'subj': subj[9:]}
 
     def decode_mime_words(self, s):
-        words=[]
+        words = []
         decoded = False
         for word, encoding in email.header.decode_header(s):
-            if(encoding):
+            if encoding:
                 decoded = True
             if isinstance(word, bytes):
-                word = word.decode(encoding or 'utf8')
+                try:
+                    word2 = word.decode(encoding or 'utf8')
+                except UnicodeDecodeError:
+                    word2 = word.decode('windows-1252')
+                word = word2
             words.append(word)
         return (''.join(words), decoded)
 
@@ -150,7 +154,7 @@ class OutlookJunkFilter():
                             if(not any(dp.lower() in f_name for dp in domain_parts[:-1]) and
                                parsed['f_user'].lower() not in f_name and
                                any(keyword in f_name for keyword in jkws)):
-                                junk_uids.append(parsed['uid']);
+                                junk_uids.append(parsed['uid'])
                                 junk_domains.add(parsed['f_domain'])
                                 del_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
                             else:
@@ -158,7 +162,7 @@ class OutlookJunkFilter():
                                 kept_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
                         else:
                             kept_msgs.append(parsed)
-                            kept_file.write(f"email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+                            kept_file.write(f"email={parsed['f_user']}@{parsed['f_domain']}\n")
 
                     pbar.update(1)
             junk_pct = len(junk_uids)/len(uids) * 100
