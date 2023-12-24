@@ -91,7 +91,7 @@ class OutlookJunkFilter():
         pattern = r'([^@]*)@([^$]*)'
         matches = re.search(pattern, self.username)
         if(matches):
-            jkws.add(matches.group(1)),
+            jkws.add(matches.group(1))
 
         r, d = self.imap.uid('SEARCH', 'ALL')
         if(not d[0].decode()):
