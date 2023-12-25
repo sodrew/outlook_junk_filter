@@ -21,7 +21,7 @@ class OutlookSendSmtp:
             self.smtp.ehlo(lhost)
             r, d = self.smtp.login(username, password, initial_response_ok=True)
             assert r == 235, 'login failed: %s' % str(r)
-            print("\SMTP Signed in as %s" % self.username)
+            print("\tSMTP Signed in as %s" % self.username)
         except Exception as err:
             print("\tSign in error: %s" % str(err))
 

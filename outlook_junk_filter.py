@@ -88,6 +88,8 @@ class OutlookJunkFilter():
         junk_uids = []
         junk_domains = set()
         jkws = set(junk_keywords.junk_keywords)
+
+        # add our own username to junk keywords
         pattern = r'([^@]*)@([^$]*)'
         matches = re.search(pattern, self.username)
         if(matches):
@@ -113,9 +115,8 @@ class OutlookJunkFilter():
         try:
             with tqdm.tqdm(total=len(uids), bar_format='\t{percentage:3.0f}%[{bar:20}] {remaining}s left') as pbar:
                 for uid in uids:
-                    resp, data = self.imap.uid('FETCH',
-                                           str(uid),
-                                           '(BODY.PEEK[HEADER.FIELDS (From Subject)] RFC822.SIZE)')
+                    resp, data = self.imap.uid('FETCH', str(uid),
+                     '(BODY.PEEK[HEADER.FIELDS (From Subject)] RFC822.SIZE)')
                     raw_header = data[0][1].decode()
                     (decoded_header, decoded) = self.decode_mime_words(raw_header)
                     if(decoded):
@@ -145,21 +146,27 @@ class OutlookJunkFilter():
                             # if we have a from name, check it for typical junk
                             from unidecode import unidecode
                             # first, convert any unicode to ascii
-                            f_name = unidecode( parsed['f_name'])
+                            f_name = unidecode(parsed['f_name'])
 
                             # second, we strip all non a-Z characters
                             f_name = regex.sub('', f_name).lower()
 
-                            # third, ensure the from and user doesn't match the domain (we strip the last participle..mostly the .com).  (e.g., warby parkers shouldn't be deleted if the domain is legit
-                            if(not any(dp.lower() in f_name for dp in domain_parts[:-1]) and
-                               parsed['f_user'].lower() not in f_name and
-                               any(keyword in f_name for keyword in jkws)):
+                            # third, ensure the sender and user doesn't match the domain (we strip the last participle...mostly the .com).  (e.g., warby parkers shouldn't be deleted if the domain is legit
+
+                            jkws_match = any(kw in f_name for kw in jkws)
+
+                            user_in_fn = parsed['f_user'].lower() in f_name
+
+                            dom_in_fn = any(dp.lower() in f_name
+                                            for dp in domain_parts[:-1])
+
+                            if jkws_match and not (user_in_fn or dom_in_fn):
                                 junk_uids.append(parsed['uid'])
                                 junk_domains.add(parsed['f_domain'])
-                                del_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+                                del_file.write(f"debug={f_name} jkws={jkws_match} usr={user_in_fn} dom={dom_in_fn} sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']}\n")
                             else:
                                 kept_msgs.append(parsed)
-                                kept_file.write(f"sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']} debug={f_name}\n")
+                                kept_file.write(f"debug={f_name} jkws={jkws_match} usr={user_in_fn} dom={dom_in_fn} sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']}\n")
                         else:
                             kept_msgs.append(parsed)
                             kept_file.write(f"email={parsed['f_user']}@{parsed['f_domain']}\n")
