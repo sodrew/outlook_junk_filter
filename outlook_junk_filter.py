@@ -177,7 +177,15 @@ class OutlookJunkFilter():
             for msg in kept_msgs:
                 if(msg['f_domain'] in junk_domains):
                     junk_uids.append(msg['uid'])
-                    del_file.write(f"sender={msg['f_name']} email={msg['f_user']}@{msg['f_domain']} debug=<junk_domain>\n")
+                    log_str = ''
+                    if 'f_name' in msg:
+                        log_str += f"sender={msg['f_name']}"
+                    if 'f_user' in msg:
+                        log_str += f" email={msg['f_user']}"
+                    if 'f_domain' in msg:
+                        log_str += f" @{msg['f_domain']} "
+                    log_str += " debug=<junk_domain>\n"
+                    del_file.write(log_str)
                     count += 1
             if(count > 0):
                 print(f"\t{len(junk_uids)} junk messages found based on keywords; {count} by common domain")
