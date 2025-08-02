@@ -1,11 +1,8 @@
-# the email account
-user = 'xxx@hotmail.com'
+# Azure App Credentials
+CLIENT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
-# the app password for the email account
-pwd = 'abcdefghijklmnop'
+# email to send mails to (usually the same as the one connected to azure)
+EMAIL_ID = "xxxx@hotmail.com"
 
-# outlook domain
-server = 'outlook.office365.com'
-
-# outlook IMAP port
-port = 993
+# Spamhaus DQS key
+DQS_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxx"
