@@ -1,227 +1,245 @@
-import imaplib
-import email.header
+import os
+import requests
 import re
 import tqdm
 from datetime import date
+from unidecode import unidecode
+import junk_keywords
+from msal import PublicClientApplication, SerializableTokenCache
+from pprint import pprint
+import argparse
+import traceback
+import logging
+logger = logging.getLogger("junkconfig")
 
 import config
-import junk_keywords
-from outlook_send_smtp import OutlookSendSmtp
+from msgraphapi import MSGraphAPI
+from persistence import Persistence
 
-class OutlookJunkFilter():
+class OutlookJunkFilter:
     def __init__(self):
-        self.imap = None
-        self.username = None
+        self.msgraphapi = MSGraphAPI()
+        self.msgraphapi.authenticate()
+        self.persist = Persistence(self.msgraphapi)
+        logger.debug("Initialized GraphAPIJunkFilter")
 
-    def login(self, username, password, server, port):
-        self.username = username
-        try:
-            self.imap = imaplib.IMAP4_SSL(server, port)
-            # self.imap.starttls()
-            r, d = self.imap.login(username, password)
-            assert r == 'OK', 'login failed: %s' % str(r)
-            print("\tIMAP Signed in as %s" % self.username)
-            self.imap.select('Junk')
+    def get_fingerprint_from_headers(self, headers):
+        ip = None
+        dkim_domain = None
+        from_address = None
 
-        except Exception as err:
-            print("\tSign in error: %s" % str(err))
-            assert False, 'login failed'
+        for h in headers:
+            name = h['name'].lower()
+            value = h['value']
 
-    def logout(self):
-        self.imap.close()
-        self.imap.logout()
+            if name == 'authentication-results':
+                match = re.search(r'sender IP is ([\d.]+)', value)
+                if match:
+                    ip = match.group(1)
+            elif name == 'dkim-signature':
+                match = re.search(r'd=([^;]+)', value)
+                if match:
+                    dkim_domain = match.group(1)
+            elif name == 'from':
+                match = re.search(r'<(.+?)>', value)
+                if match:
+                    from_address = match.group(1)
 
-    def delete_junk(self, msgs):
-        if(len(msgs) > 0):
-            print(f'\tExecuting delete')
-            self.imap.uid('STORE',
-                          ','.join(msgs),
-                          '+FLAGS', '\\Deleted')
-            print(f'\t{len(msgs)} msgs were deleted')
-        else:
-            print(f'\tNo msgs were deleted')
+        logger.debug(f"Sender IP   : {ip}")
+        logger.debug(f"DKIM domain : {dkim_domain}")
+        logger.debug(f"From address: {from_address}")
+        return {'ip':ip, 'dkim':dkim_domain, 'from':from_address}
 
-    def parse(self, uid, from_str, subj):
-        pattern = r'([^<]*)<([^@]*)@([^>]*)>'
-        matches = re.search(pattern, from_str[6:])
-        if(matches):
-            return {'uid': uid,
-                    'from': from_str[6:].replace('"', ''),
-                    'f_name': matches.group(1).replace('"', ''),
-                    'f_user': matches.group(2),
-                    'f_domain': matches.group(3),
-                    'subj': subj[9:]}
-        else:
-            pattern = r'([^@]*)@([^$]*)'
-            matches = re.search(pattern, from_str[6:])
-            if(matches):
-                return {'uid': uid,
-                        'from': from_str[6:],
-                        'f_user': matches.group(1),
-                        'f_domain': matches.group(2),
-                        'subj': subj[9:]}
-            else:
-                return {'uid': uid,
-                        'from': from_str[6:],
-                        'subj': subj[9:]}
+    def get_junk_emails(self):
+        """
+        Retrieve emails from the Junk Email folder.
+        """
+        logger.info('retrieving junk email')
 
-    def decode_mime_words(self, s):
-        words = []
-        decoded = False
-        for word, encoding in email.header.decode_header(s):
-            if encoding:
-                decoded = True
-            if isinstance(word, bytes):
-                try:
-                    word2 = word.decode(encoding or 'utf8')
-                except UnicodeDecodeError:
-                    word2 = word.decode('windows-1252')
-                word = word2
-            words.append(word)
-        return (''.join(words), decoded)
+        base = 'mailFolders/JunkEmail/messages'
+        count = 50
+        fields = [
+            'subject',
+            'from',
+            'sender',
+            'internetMessageHeaders',
+            ]
+        order = 'receivedDateTime asc'
 
-    def ireplace(self, old, repl, text):
-        return re.sub('(?i)'+re.escape(old), lambda m: repl, text)
+        url = f"{base}?$top={count}&$orderby={order}&$select={','.join(fields)}"
+        all_messages = []
+        while url:
+            data = self.msgraphapi.get_api(url)
 
-    def iterate_msgs(self):
-        kept_msgs = []
+            # ✅ Get nextLink BEFORE deleting anything
+            next_link = data.get('@odata.nextLink')
+            messages = data.get('value', [])
+            logging.info(f'got {len(messages)} messages')
+
+            for msg in messages:
+                msg_id = msg['id']
+                subject = msg.get('subject', '(no subject)')
+                logging.debug(f'\t: {subject}')
+
+                headers = msg.get('internetMessageHeaders', [])
+                fp = self.get_fingerprint_from_headers(headers)
+                msg['fp'] = fp
+
+                all_messages.append(msg)
+
+            if url == next_link:
+                break
+
+            url = next_link
+
+        return all_messages
+
+    def delete_emails(self, email_ids):
+        """
+        Delete emails by ID using batch requests.
+        """
+        self.msgraphapi.batch_delete_msgs(email_ids)
+
+    def send_report(self, junk_uids, kept_msgs):
+        # Prepare summary
+        report = (
+            f"Outlook Junk Filter - {str(date.today())}\n"
+            f"Deleted {len(junk_uids)} junk emails.\n"
+            f"Retained {len(kept_msgs)} emails.\n"
+            f"Deleted messages log: messages_deleted.txt\n"
+            f"Kept messages log: messages_kept.txt\n"
+        )
+
+        # Send notification with attachments
+        self.msgraphapi.send_email(
+            subject=f"Outlook Junk Filter - {str(date.today())}",
+            body=report,
+            recipients=[config.EMAIL_ID],
+            attachments=["messages_deleted.txt", "messages_kept.txt"]
+        )
+
+        logger.info(f'sent report: {report}')
+
+    def filter_junk_emails(self, emails):
+        """
+        Filter junk emails based on keywords and sender information.
+        """
         junk_uids = []
+        kept_msgs = []
         junk_domains = set()
         jkws = set(junk_keywords.junk_keywords)
-
-        # add our own username to junk keywords
-        pattern = r'([^@]*)@([^$]*)'
-        matches = re.search(pattern, self.username)
-        if(matches):
-            jkws.add(matches.group(1))
-
-        r, d = self.imap.uid('SEARCH', 'ALL')
-        if(not d[0].decode()):
-            print('\tExiting, no emails found')
-            return junk_uids
-
-        uids = d[0].decode().split(' ')
-
-        if(len(uids) < 1):
-            print('\tExiting, no emails found')
-            return junk_uids
-
-        print(f'\t{len(uids)} msgs to process in "Junk Email" folder')
 
         del_file = open("messages_deleted.txt", "w")
         kept_file = open("messages_kept.txt", "w")
 
         regex = re.compile('[^a-zA-Z0-9]')
         try:
-            with tqdm.tqdm(total=len(uids), bar_format='\t{percentage:3.0f}%[{bar:20}] {remaining}s left') as pbar:
-                for uid in uids:
-                    resp, data = self.imap.uid('FETCH', str(uid),
-                     '(BODY.PEEK[HEADER.FIELDS (From Subject)] RFC822.SIZE)')
-                    raw_header = data[0][1].decode()
-                    (decoded_header, decoded) = self.decode_mime_words(raw_header)
-                    if(decoded):
-                        if(decoded_header[0:4].lower() == 'from'):
-                            decoded_header = self.ireplace('Subject', '\r\nSubject', decoded_header)
-                        else:
-                            decoded_header = self.ireplace('From', '\r\nFrom', decoded_header)
+            for email in tqdm.tqdm(emails, desc="Processing emails", bar_format='{percentage:3.0f}%|{bar:20}| {remaining}s left'):
+                email_id = email.get("id")
+                sender = email.get("from", {}).get("emailAddress", {}).get("address", "")
+                subject = email.get("subject", "")
 
-                    from_subject = decoded_header.split('\r\n')
+                if sender:
+                    domain = sender.split("@")[-1]
+                    domain_parts = domain.split(".")
+                    if len(domain_parts) < 2:
+                        junk_uids.append(email_id)
+                        del_file.write(f"Invalid sender: {sender}\n")
+                        continue
 
-                    if(from_subject[0][0:4] == 'From'):
-                        parsed = self.parse(uid, from_subject[0], from_subject[1])
-                    else:
-                        parsed = self.parse(uid, from_subject[1], from_subject[0])
-                    if('f_domain' not in parsed):
-                        # if we can't find an email domain, this is junk
-                        junk_uids.append(parsed['uid'])
-                        del_file.write(f"raw={parsed['from']}\n")
-                    else:
-                        domain_parts = parsed['f_domain'].split('.')
-                        if(len(domain_parts) == 0):
-                            # invalid domain, this is more junk
-                            junk_uids.append(parsed['uid'])
-                            junk_domains.add(parsed['f_domain'])
-                            del_file.write(f"raw={parsed['from']}\n")
-                        elif('f_name' in parsed):
-                            # if we have a from name, check it for typical junk
-                            from unidecode import unidecode
-                            # first, convert any unicode to ascii
-                            f_name = unidecode(parsed['f_name'])
+                    # Process sender name and filter junk based on keywords
+                    from_name = email.get("from", {}).get("emailAddress", {}).get("name", "")
+                    if from_name:
+                        from_name = unidecode(from_name)
+                        squashed_from = regex.sub('', from_name).lower()
 
-                            # second, we strip all non a-Z characters
-                            f_name = regex.sub('', f_name).lower()
+                    if squashed_from:
+                        # Check junk criteria
+                        jkws_match = any(kw in squashed_from for kw in jkws)
 
-                            # third, ensure the sender and user doesn't match the domain (we strip the last participle...mostly the .com).  (e.g., warby parkers shouldn't be deleted if the domain is legit
+                        persist_kw = None
+                        if not jkws_match:
+                            persist_kw = any(kw in squashed_from for kw in self.persist.configs.get('keywords',{}).keys())
 
-                            jkws_match = any(kw in f_name for kw in jkws)
+                        persist_dsfx = None
+                        if not persist_kw:
+                            persist_dsfx = domain in self.persist.configs.get('domain_sfx',{}).keys()
+                        persist_dkim = None
+                        if not persist_dsfx:
+                            persist_dkim = domain in self.persist.configs.get('domain_dkim',{}).keys()
+                        if jkws_match or persist_kw or persist_dsfx or persist_dkim:
+                            junk_uids.append(email_id)
+                            junk_domains.add(domain)
+                            del_file.write(f"Junk sender: {squashed_from}, Email: {sender}, {email.get('fp')}\n")
+                            self.persist.update('keywords', squashed_from)
+                            self.persist.update('domain_sfx', domain)
+                            fp = email.get('fp', {})
+                            self.persist.update('domain_dkim', fp.get('dkim'))
+                            self.persist.update('ipaddrs', fp.get('ip'), {'domain': fp.get('dkim')})
+                            continue
 
-                            user_in_fn = parsed['f_user'].lower() in f_name
+                    # If not junk, keep email
+                    kept_msgs.append(email)
+                    if squashed_from:
+                        kept_file.write(f"{squashed_from}, From: {sender}, Subject: {subject}\n")
 
-                            dom_in_fn = any(dp.lower() in f_name
-                                            for dp in domain_parts[:-1])
-
-                            if jkws_match and not (user_in_fn or dom_in_fn):
-                                junk_uids.append(parsed['uid'])
-                                junk_domains.add(parsed['f_domain'])
-                                del_file.write(f"debug={f_name} jkws={jkws_match} usr={user_in_fn} dom={dom_in_fn} sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']}\n")
-                            else:
-                                kept_msgs.append(parsed)
-                                kept_file.write(f"debug={f_name} jkws={jkws_match} usr={user_in_fn} dom={dom_in_fn} sender={parsed['f_name']} email={parsed['f_user']}@{parsed['f_domain']}\n")
-                        else:
-                            kept_msgs.append(parsed)
-                            kept_file.write(f"email={parsed['f_user']}@{parsed['f_domain']}\n")
-
-                    pbar.update(1)
-            junk_pct = len(junk_uids)/len(uids) * 100
-            count = 0
-            for msg in kept_msgs:
-                if(msg['f_domain'] in junk_domains):
-                    junk_uids.append(msg['uid'])
-                    log_str = ''
-                    if 'f_name' in msg:
-                        log_str += f"sender={msg['f_name']}"
-                    if 'f_user' in msg:
-                        log_str += f" email={msg['f_user']}"
-                    if 'f_domain' in msg:
-                        log_str += f" @{msg['f_domain']} "
-                    log_str += " debug=<junk_domain>\n"
-                    del_file.write(log_str)
-                    count += 1
-            if(count > 0):
-                print(f"\t{len(junk_uids)} junk messages found based on keywords; {count} by common domain")
-            else:
-                print(f"\t{len(junk_uids)} ({junk_pct:.1f}%) were junk msgs")
-            print('\t\tdeleted msgs can be found in: messages_deleted.txt')
-            print('\t\tretained msgs can be found in: messages_kept.txt')
+        except Exception as e:
+            logger.error("An error occurred:", str(e))
+            traceback.print_exc()
         finally:
-            kept_file.close()
             del_file.close()
+            kept_file.close()
 
-        return junk_uids
+        self.persist.print()
+        self.persist.save_all()
+        return junk_uids, kept_msgs, junk_domains
 
 
-def main():
-    mail = OutlookJunkFilter()
-    sendmail = OutlookSendSmtp()
-    try:
-        mail.login(config.user, config.pwd,
-                   config.server, config.port)
-        junk_uids = mail.iterate_msgs()
-        mail.delete_junk(junk_uids)
+def check_debug_logging():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--info', action='store_true', help='Enable info output')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--debug_all', action='store_true', help='Enable debug output')
+    args = parser.parse_args()
+    # 🔧 Configure logging format and root level
+    # Global config to silence other modules
 
-        sendmail.login(config.user,
-                       config.pwd,
-                       config.server_smtp,
-                       config.port_smtp)
-        sendmail.send(config.notify,
-                      'OutlookJunkFilter - ' + str(date.today()), 'logs attached',
-                      ['./messages_deleted.txt',
-                       './messages_kept.txt',])
+    if args.debug_all:
+        logging_level_for_all = logging.DEBUG
+    else:
+        logging_level_for_all = logging.WARNING
 
-    finally:
-        mail.logout()
-        sendmail.logout()
+
+    logging.basicConfig(
+        format='[%(name)s] %(funcName)s(): %(message)s',
+        level=logging_level_for_all
+    )
+
+    if not args.debug_all:
+        logging_level = logging.WARNING
+        if args.info:
+            logging_level = logging.INFO
+        if args.debug:
+            logging_level = logging.DEBUG
+        logging.getLogger("junkconfig").setLevel(logging_level)
+        logging.getLogger("msgraphapi").setLevel(logging_level)
+        logging.getLogger("persistence").setLevel(logging_level)
 
 
 if __name__ == "__main__":
-    main()
+    check_debug_logging()
+
+    ojf = OutlookJunkFilter()
+    try:
+        # Retrieve and filter emails
+        emails = ojf.get_junk_emails()
+        junk_uids, kept_msgs, junk_domains = ojf.filter_junk_emails(emails)
+
+        # Delete junk emails
+        ojf.delete_emails([junk_uids[0]])
+
+        ojf.send_report(junk_uids, kept_msgs)
+
+    except Exception as e:
+        logger.error("An error occurred:", str(e))
+        traceback.print_exc()
